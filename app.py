@@ -101,7 +101,7 @@ def node_extract_website(state):
     return state
 
 # ---------------- Optimized Compare Node ----------------
-def node_compare_mismatch_optimized(state):
+def node_compare_mismatch(state):
     model, processor, device = load_clip_lora_model()
     
     # Compute Figma embeddings once
