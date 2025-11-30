@@ -79,7 +79,7 @@ def load_clip_lora_model():
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     # LoRA adapter (example on visual.proj)
     config=LoraConfig(r=8,lora_alpha=16.0,target_modules=["visual.proj"],
-                      lora_dropout=0.0,bias="none",task_type="IMAGE_CLASSIFICATION")
+                      lora_dropout=0.0,bias="none",task_type="FEATURE_EXTRACTION")
     peft_model = get_peft_model(clip_model,config)
     peft_model.eval()
     return peft_model, processor, device
