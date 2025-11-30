@@ -100,22 +100,46 @@ def node_extract_website(state):
     state['website_components'] = contour_extract(state['website_img'])
     return state
 
-def node_compare_mismatch(state):
+# ---------------- Optimized Compare Node ----------------
+def node_compare_mismatch_optimized(state):
     model, processor, device = load_clip_lora_model()
-    mismatches=[]
-    for wb in state['website_components']:
-        wb_emb=get_embedding(wb['crop'],model,processor,device)
-        best=None; best_d=float('inf')
+    
+    # Compute Figma embeddings once
+    if 'figma_embeddings' not in state:
+        fig_embs=[]
         for f in state['figma_components']:
-            f_emb=get_embedding(f['crop'],model,processor,device)
-            d=np.linalg.norm(f_emb - wb_emb)
-            if d<best_d: best_d=d; best=f
+            emb=get_embedding(f['crop'], model, processor, device)
+            fig_embs.append({'node':f,'embedding':emb})
+        state['figma_embeddings']=fig_embs
+    else:
+        fig_embs=state['figma_embeddings']
+
+    mismatches=[]
+    web_crops=[wb['crop'] for wb in state['website_components']]
+    web_coords=[(wb['x'],wb['y'],wb['w'],wb['h']) for wb in state['website_components']]
+
+    # Batch embeddings for website components
+    web_embs=[]
+    for crop in web_crops:
+        emb=get_embedding(crop, model, processor, device)
+        web_embs.append(emb)
+
+    for wb_idx, wb_emb in enumerate(web_embs):
+        wb = state['website_components'][wb_idx]
+        best=None; best_d=float('inf')
+        for f in fig_embs:
+            d=np.linalg.norm(f['embedding'] - wb_emb)
+            if d<best_d:
+                best_d=d
+                best=f['node']
         fig_w,fig_h=best['w'],best['h']
         web_w,web_h=wb['w'],wb['h']
         status_layout="match" if abs(fig_w-web_w)<=10 and abs(fig_h-web_h)<=10 else "mismatch"
+
         fig_color=np.round(avg_color_bgr(best['crop'])).astype(int)
         web_color=np.round(avg_color_bgr(wb['crop'])).astype(int)
         status_color="match" if np.linalg.norm(fig_color-web_color)<=30 else "mismatch"
+
         if status_layout=="mismatch" or status_color=="mismatch":
             mismatches.append({
                 'figma_dim':f"{fig_w} x {fig_h}",
@@ -124,10 +148,12 @@ def node_compare_mismatch(state):
                 'color_figma':closest_color_name(fig_color),
                 'color_website':closest_color_name(web_color),
                 'status_color':status_color,
-                'web_coords':(wb['x'],wb['y'],wb['w'],wb['h'])
+                'web_coords':web_coords[wb_idx]
             })
+
     state['mismatches']=mismatches
     return state
+
 
 def node_draw_overlay(state):
     overlay = state['website_img'].copy()
