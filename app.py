@@ -1,11 +1,9 @@
 import streamlit as st
-import os
 import cv2
 import numpy as np
 from PIL import Image
 import torch
 from transformers import CLIPProcessor, CLIPModel
-from peft import LoraConfig, get_peft_model
 import webcolors
 import json
 
@@ -47,7 +45,6 @@ def contour_extract(image_bgr, min_area=1500):
 
 # ---------------- StateGraph ----------------
 END="__END__"
-
 class StateGraph:
     def __init__(self):
         self.nodes={}
@@ -71,34 +68,14 @@ class StateGraph:
             return state
         return executor
 
-# ---------------- CLIP + LoRA model ----------------
+# ---------------- CLIP Model ----------------
 @st.cache_resource
-def load_clip_lora_model():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Load base CLIP
+def load_clip_model():
+    device="cuda" if torch.cuda.is_available() else "cpu"
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    
-    # LoRA config on valid transformer modules
-    config = LoraConfig(
-        r=8,
-        lora_alpha=16.0,
-        target_modules=[
-            "visual.encoder.layer.0.self_attn.q_proj",
-            "visual.encoder.layer.0.self_attn.k_proj",
-            "visual.encoder.layer.0.self_attn.v_proj",
-            "visual.encoder.layer.0.mlp.fc1",
-            "visual.encoder.layer.0.mlp.fc2"
-        ],
-        lora_dropout=0.0,
-        bias="none",
-        task_type="FEATURE_EXTRACTION"
-    )
-    
-    peft_model = get_peft_model(clip_model, config)
-    peft_model.eval()
-    return peft_model, processor, device
+    clip_model.eval()
+    return clip_model, processor, device
 
 def get_embedding(crop, model, processor, device):
     img=Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
@@ -116,46 +93,22 @@ def node_extract_website(state):
     state['website_components'] = contour_extract(state['website_img'])
     return state
 
-# ---------------- Optimized Compare Node ----------------
 def node_compare_mismatch(state):
-    model, processor, device = load_clip_lora_model()
-    
-    # Compute Figma embeddings once
-    if 'figma_embeddings' not in state:
-        fig_embs=[]
-        for f in state['figma_components']:
-            emb=get_embedding(f['crop'], model, processor, device)
-            fig_embs.append({'node':f,'embedding':emb})
-        state['figma_embeddings']=fig_embs
-    else:
-        fig_embs=state['figma_embeddings']
-
+    model, processor, device = load_clip_model()
     mismatches=[]
-    web_crops=[wb['crop'] for wb in state['website_components']]
-    web_coords=[(wb['x'],wb['y'],wb['w'],wb['h']) for wb in state['website_components']]
-
-    # Batch embeddings for website components
-    web_embs=[]
-    for crop in web_crops:
-        emb=get_embedding(crop, model, processor, device)
-        web_embs.append(emb)
-
-    for wb_idx, wb_emb in enumerate(web_embs):
-        wb = state['website_components'][wb_idx]
+    for wb in state['website_components']:
+        wb_emb=get_embedding(wb['crop'],model,processor,device)
         best=None; best_d=float('inf')
-        for f in fig_embs:
-            d=np.linalg.norm(f['embedding'] - wb_emb)
-            if d<best_d:
-                best_d=d
-                best=f['node']
+        for f in state['figma_components']:
+            f_emb=get_embedding(f['crop'],model,processor,device)
+            d=np.linalg.norm(f_emb - wb_emb)
+            if d<best_d: best_d=d; best=f
         fig_w,fig_h=best['w'],best['h']
         web_w,web_h=wb['w'],wb['h']
         status_layout="match" if abs(fig_w-web_w)<=10 and abs(fig_h-web_h)<=10 else "mismatch"
-
         fig_color=np.round(avg_color_bgr(best['crop'])).astype(int)
         web_color=np.round(avg_color_bgr(wb['crop'])).astype(int)
         status_color="match" if np.linalg.norm(fig_color-web_color)<=30 else "mismatch"
-
         if status_layout=="mismatch" or status_color=="mismatch":
             mismatches.append({
                 'figma_dim':f"{fig_w} x {fig_h}",
@@ -164,12 +117,10 @@ def node_compare_mismatch(state):
                 'color_figma':closest_color_name(fig_color),
                 'color_website':closest_color_name(web_color),
                 'status_color':status_color,
-                'web_coords':web_coords[wb_idx]
+                'web_coords':(wb['x'],wb['y'],wb['w'],wb['h'])
             })
-
     state['mismatches']=mismatches
     return state
-
 
 def node_draw_overlay(state):
     overlay = state['website_img'].copy()
@@ -185,10 +136,10 @@ def node_draw_overlay(state):
             box_color=(128,0,128) # Purple
         cv2.rectangle(overlay,(x,y),(x+w,y+h),box_color,3)
     # Legend
-    cv2.rectangle(overlay,(10,10),(260,110),(255,255,255),-1)
-    cv2.putText(overlay,'Red → Layout mismatch',(20,35),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
-    cv2.putText(overlay,'Blue → Color mismatch',(20,65),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,0,0),2)
-    cv2.putText(overlay,'Purple → Both mismatch',(20,95),cv2.FONT_HERSHEY_SIMPLEX,0.7,(128,0,128),2)
+    cv2.rectangle(overlay,(10,10),(300,120),(255,255,255),-1)
+    cv2.putText(overlay,'Red → Layout mismatch',(20,40),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,0,255),2)
+    cv2.putText(overlay,'Blue → Color mismatch',(20,70),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,0,0),2)
+    cv2.putText(overlay,'Purple → Both mismatch',(20,100),cv2.FONT_HERSHEY_SIMPLEX,0.7,(128,0,128),2)
     state['overlay_image']=overlay
     return state
 
@@ -213,7 +164,7 @@ executor=sg.compile()
 
 # ---------------- Streamlit UI ----------------
 st.set_page_config(layout="wide")
-st.title("🚨 Figma ↔ Website Comparator (CLIP + LoRA) — Mismatches Only")
+st.title("🚨 Figma ↔ Website Comparator (CLIP) — Mismatches Only")
 
 col1,col2=st.columns(2)
 fig_file=col1.file_uploader("Upload Figma Image",type=['png','jpg','jpeg'])
