@@ -74,13 +74,29 @@ class StateGraph:
 # ---------------- CLIP + LoRA model ----------------
 @st.cache_resource
 def load_clip_lora_model():
-    device="cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Load base CLIP
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    # LoRA adapter (example on visual.proj)
-    config=LoraConfig(r=8,lora_alpha=16.0,target_modules=["visual.proj"],
-                      lora_dropout=0.0,bias="none",task_type="FEATURE_EXTRACTION")
-    peft_model = get_peft_model(clip_model,config)
+    
+    # LoRA config on valid transformer modules
+    config = LoraConfig(
+        r=8,
+        lora_alpha=16.0,
+        target_modules=[
+            "visual.encoder.layer.0.self_attn.q_proj",
+            "visual.encoder.layer.0.self_attn.k_proj",
+            "visual.encoder.layer.0.self_attn.v_proj",
+            "visual.encoder.layer.0.mlp.fc1",
+            "visual.encoder.layer.0.mlp.fc2"
+        ],
+        lora_dropout=0.0,
+        bias="none",
+        task_type="FEATURE_EXTRACTION"
+    )
+    
+    peft_model = get_peft_model(clip_model, config)
     peft_model.eval()
     return peft_model, processor, device
 
