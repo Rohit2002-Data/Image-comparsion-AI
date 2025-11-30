@@ -1,21 +1,13 @@
-# Previous Version (Before CLIP + LoRA Vision Upgrade)
-# --------------------------------------------------
-# This version keeps the old lightweight pipeline
-# without Vision Transformer, CLIP, or LoRA integration.
-# Nodes are simple and rely on contour extraction + small CNN encoder.
-
 import streamlit as st
 import os
-import io
 import json
-import time
 import cv2
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-from typing import Dict, Any
+from transformers import CLIPProcessor, CLIPModel
+from webcolors import rgb_to_name, CSS3_HEX_TO_NAMES
 
 # -------------------- Utilities --------------------
 def ensure_dir(d): os.makedirs(d, exist_ok=True)
@@ -24,7 +16,6 @@ ensure_dir('./artifacts')
 def img_to_cv(img): return cv2.cvtColor(np.array(img.convert('RGB')), cv2.COLOR_RGB2BGR)
 def cv_to_pil(img_cv): return Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
 
-# Simple contour extractor
 def contour_extract(image_bgr, min_area=1500):
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     th = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,15,9)
@@ -35,6 +26,23 @@ def contour_extract(image_bgr, min_area=1500):
         if w*h < min_area: continue
         comps.append({'x':x,'y':y,'w':w,'h':h,'crop':image_bgr[y:y+h,x:x+w]})
     return sorted(comps, key=lambda c: c['w']*c['h'], reverse=True)
+
+def avg_color_bgr(img_bgr):
+    return np.mean(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).reshape(-1,3),axis=0)
+
+def closest_color_name(rgb):
+    try:
+        return rgb_to_name(tuple(rgb))
+    except:
+        min_dist = float('inf')
+        closest_name = None
+        for hex_val, name in CSS3_HEX_TO_NAMES.items():
+            r_c, g_c, b_c = tuple(int(hex_val[i:i+2],16) for i in (1,3,5))
+            dist = np.linalg.norm(np.array([r_c,g_c,b_c])-np.array(rgb))
+            if dist < min_dist:
+                min_dist = dist
+                closest_name = name
+        return closest_name
 
 # -------------------- StateGraph --------------------
 END = "__END__"
@@ -67,117 +75,134 @@ def node_extract_figma(state):
     state['figma_components'] = contour_extract(state['figma_img'])
     return state
 
-# small CNN encoder (no CLIP)
-class SmallEnc(nn.Module):
-    def __init__(self, out=64):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3,16,3,2,1), nn.ReLU(),
-            nn.Conv2d(16,32,3,2,1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1,1))
-        )
-        self.fc = nn.Linear(32, out)
-    def forward(self,x): return self.fc(self.conv(x).view(x.size(0),-1))
-
-def node_pretrain(state):
-    enc=SmallEnc(); enc.eval()
-    comps = state.get('figma_components',[])
-    emb=[]
-    with torch.no_grad():
-        for c in comps:
-            crop=cv2.resize(c['crop'],(64,64))
-            t=torch.tensor(crop).permute(2,0,1).float().unsqueeze(0)/255
-            emb.append({'node':c,'embedding':enc(t).squeeze(0).numpy().tolist()})
-    state['model']=enc
-    state['fig_embeddings']=emb
-    return state
-
 def node_extract_website(state):
-    state['website_components']=contour_extract(state['website_img'])
+    state['website_components'] = contour_extract(state['website_img'])
+    state['web_yolo_boxes'] = state['website_components']  # simple contour detection
     return state
 
-def node_align(state):
-    state['aligned']=False
+def node_pretrain_clip(state):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    state['clip_model'] = model
+    state['clip_processor'] = processor
+    state['clip_device'] = device
+
+    embeddings = []
+    with torch.no_grad():
+        for c in state['figma_components']:
+            img = Image.fromarray(cv2.cvtColor(c['crop'], cv2.COLOR_BGR2RGB))
+            inputs = processor(images=img, return_tensors="pt").to(device)
+            emb = model.get_image_features(**inputs)
+            embeddings.append({'node': c, 'embedding': emb.cpu().numpy().squeeze()})
+    state['fig_embeddings'] = embeddings
     return state
 
-def node_yolo_detect(state):
-    state['web_yolo_boxes']=contour_extract(state['website_img'])
-    return state
+def node_compare_clip(state):
+    model = state['clip_model']
+    processor = state['clip_processor']
+    device = state['clip_device']
+    fig_embs = state['fig_embeddings']
+    mismatches = []
 
-def avg_color_bgr(img_bgr):
-    return np.mean(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).reshape(-1,3),axis=0)
+    for wb in state['web_yolo_boxes']:
+        img = Image.fromarray(cv2.cvtColor(wb['crop'], cv2.COLOR_BGR2RGB))
+        inputs = processor(images=img, return_tensors="pt").to(device)
+        with torch.no_grad():
+            wemb = model.get_image_features(**inputs).cpu().numpy().squeeze()
 
-def node_compare(state):
-    fig_embs=state['fig_embeddings']; web_boxes=state['web_yolo_boxes']; model=state['model']
-    matches=[]
-    for wb in web_boxes:
-        crop=cv2.resize(wb['crop'],(64,64))
-        t=torch.tensor(crop).permute(2,0,1).float().unsqueeze(0)/255
-        with torch.no_grad(): wemb=model(t).squeeze(0).numpy()
-        best=None; best_d=1e9
+        # find best matching Figma component
+        best = None; best_d = float('inf')
         for f in fig_embs:
-            d=np.linalg.norm(np.array(f['embedding'])-wemb)
-            if d<best_d: best_d=d; best=f['node']
-        dim={'fig_w':best['w'],'fig_h':best['h'],'web_w':wb['w'],'web_h':wb['h']}
-        color_diff=np.linalg.norm(avg_color_bgr(best['crop'])-avg_color_bgr(wb['crop']))
-        matches.append({'fig':best,'web':wb,'dim':dim,'color_diff':color_diff,'score':best_d})
-    state['matches']=matches
+            d = np.linalg.norm(f['embedding'] - wemb)
+            if d < best_d:
+                best_d = d
+                best = f['node']
+
+        # layout check
+        fig_w, fig_h = best['w'], best['h']
+        web_w, web_h = wb['w'], wb['h']
+        status_layout = "match" if abs(fig_w-web_w)<=10 and abs(fig_h-web_h)<=10 else "mismatch"
+
+        # color check
+        fig_color = np.round(avg_color_bgr(best['crop'])).astype(int)
+        web_color = np.round(avg_color_bgr(wb['crop'])).astype(int)
+        status_color = "match" if np.linalg.norm(fig_color-web_color)<=30 else "mismatch"
+
+        if status_layout=="mismatch" or status_color=="mismatch":
+            mismatches.append({
+                'figma_dim': f"{fig_w} x {fig_h}",
+                'website_dim': f"{web_w} x {web_h}",
+                'status_layout': status_layout,
+                'color_figma': closest_color_name(fig_color),
+                'color_website': closest_color_name(web_color),
+                'status_color': status_color,
+                'web_coords': (wb['x'], wb['y'], wb['w'], wb['h'])
+            })
+
+    state['mismatches'] = mismatches
     return state
 
 def node_overlay(state):
-    web=state['website_img']; overlay=web.copy()
-    for m in state['matches']:
-        w=m['web']; x,y,wid,hei=w['x'],w['y'],w['w'],w['h']
-        is_bad=(abs(m['dim']['fig_w']-wid)>10 or abs(m['dim']['fig_h']-hei)>10)
-        color=(0,0,255) if is_bad else (0,255,0)
-        cv2.rectangle(overlay,(x,y),(x+wid,y+hei),color,3)
-    state['overlay_image']=overlay
+    web = state['website_img'].copy()
+    for m in state.get('mismatches', []):
+        x,y,w,h = m['web_coords']
+        layout = m['status_layout']=="mismatch"
+        color = m['status_color']=="mismatch"
+        if layout and color:
+            box_color = (128,0,128) # purple
+        elif layout:
+            box_color = (0,0,255)   # red
+        elif color:
+            box_color = (255,0,0)   # blue
+        else: continue
+        cv2.rectangle(web,(x,y),(x+w,y+h),box_color,3)
+
+    # Legend
+    cv2.rectangle(web,(10,10),(220,100),(255,255,255),-1)
+    cv2.putText(web,"Red: Layout mismatch",(20,30),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+    cv2.putText(web,"Blue: Color mismatch",(20,55),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,0,0),2)
+    cv2.putText(web,"Purple: Both mismatch",(20,80),cv2.FONT_HERSHEY_SIMPLEX,0.6,(128,0,128),2)
+
+    state['overlay_image'] = web
     return state
 
-def node_export(state):
-    rows=[]
-    for m in state['matches']:
-        f=m['fig']; w=m['web']
-        rows.append({'fig_x':f['x'],'fig_y':f['y'],'fig_w':f['w'],'fig_h':f['h'],
-                     'web_x':w['x'],'web_y':w['y'],'web_w':w['w'],'web_h':w['h'],
-                     'color_diff':m['color_diff'],'score':m['score']})
-    state['report_json']=json.dumps(rows,indent=2)
-    state['report_rows']=rows
-    return state
-
-# -------------------- Graph Build --------------------
-sg=StateGraph()
-sg.add_node('extract_figma',node_extract_figma)
-sg.add_node('pretrain',node_pretrain)
-sg.add_node('extract_website',node_extract_website)
-sg.add_node('align',node_align)
-sg.add_node('yolo_detect',node_yolo_detect)
-sg.add_node('compare',node_compare)
-sg.add_node('overlay',node_overlay)
-sg.add_node('export',node_export)
-sg.set_entry_point('extract_figma')
-sg.add_edge('extract_figma','pretrain')
-sg.add_edge('pretrain','extract_website')
-sg.add_edge('extract_website','align')
-sg.add_edge('align','yolo_detect')
-sg.add_edge('yolo_detect','compare')
-sg.add_edge('compare','overlay')
-sg.add_edge('overlay','export')
-sg.add_edge('export',END)
-executor=sg.compile()
+# -------------------- Build StateGraph --------------------
+sg = StateGraph()
+sg.add_node("extract_figma", node_extract_figma)
+sg.add_node("pretrain_clip", node_pretrain_clip)
+sg.add_node("extract_website", node_extract_website)
+sg.add_node("compare", node_compare_clip)
+sg.add_node("overlay", node_overlay)
+sg.set_entry_point("extract_figma")
+sg.add_edge("extract_figma","pretrain_clip")
+sg.add_edge("pretrain_clip","extract_website")
+sg.add_edge("extract_website","compare")
+sg.add_edge("compare","overlay")
+sg.add_edge("overlay", END)
+executor = sg.compile()
 
 # -------------------- Streamlit UI --------------------
-st.title("Figma ↔ Website Comparator — Old Version (No Vision Upgrade)")
+st.title("Figma ↔ Website Comparator (CLIP + LoRA Upgrade)")
 
-col1,col2=st.columns(2)
-fig_file=col1.file_uploader('Upload Figma Image',type=['png','jpg'])
-web_file=col2.file_uploader('Upload Website Screenshot',type=['png','jpg'])
+col1, col2 = st.columns(2)
+fig_file = col1.file_uploader("Upload Figma Image", type=['png','jpg'])
+web_file = col2.file_uploader("Upload Website Screenshot", type=['png','jpg'])
 
 if fig_file and web_file:
-    fig_pil=Image.open(fig_file); web_pil=Image.open(web_file)
-    fig_cv=img_to_cv(fig_pil); web_cv=img_to_cv(web_pil)
-    st.image([fig_pil,web_pil],caption=['Figma','Website'],width=350)
-    if st.button('Run Pipeline'):
-        out=executor({'figma_img':fig_cv,'website_img':web_cv})
-        st.image(cv_to_pil(out['overlay_image']),caption='Overlay')
-        st.code(out['report_json'],language='json')
+    fig_img = Image.open(fig_file)
+    web_img = Image.open(web_file)
+    fig_cv = img_to_cv(fig_img)
+    web_cv = img_to_cv(web_img)
+    st.image([fig_img, web_img], caption=["Figma","Website"], width=350)
+
+    if st.button("Run Comparison"):
+        state = {"figma_img": fig_cv, "website_img": web_cv}
+        out = executor(state)
+
+        st.image(cv_to_pil(out['overlay_image']), caption="Overlay Mismatches")
+        if out.get("mismatches"):
+            st.subheader("Mismatched Components")
+            st.json(out['mismatches'])
+        else:
+            st.success("No mismatches detected ✅")
