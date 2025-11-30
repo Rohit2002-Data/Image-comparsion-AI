@@ -5,4 +5,4 @@ transformers
 numpy
 Pillow
 opencv-python-headless
-webcolors
+webcolors==1.13
